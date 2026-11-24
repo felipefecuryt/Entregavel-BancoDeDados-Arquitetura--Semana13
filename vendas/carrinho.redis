@@ -1,0 +1,162 @@
+# ============================================================================
+# CONTEXTO DELIMITADO: VENDAS
+# SGBD: Redis (NoSQL - Chave-Valor / Cache em memoria)
+# Arquivo: carrinho.redis
+# Execucao: redis-cli < carrinho.redis
+#
+# Justificativa da escolha:
+#   O carrinho de compras e um dado efemero e de altissima frequencia. Ele e
+#   lido e reescrito a cada clique do usuario, e em 70% dos casos sera
+#   abandonado e nunca vira pedido. Guardar isso em PostgreSQL significa
+#   escrever em disco milhares de vezes por minuto para dados que vao morrer.
+#   O Redis mantem tudo em memoria (leitura/escrita em microssegundos) e
+#   oferece TTL nativo: o carrinho expira sozinho, sem job de limpeza.
+#   No Teorema CAP este contexto e AP: disponibilidade e latencia vencem.
+#   Perder um carrinho e um incomodo; perder uma fatura e um processo.
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# 1) SESSAO DO USUARIO
+#    Hash com os dados da sessao. TTL de 30 minutos (1800s): se o usuario
+#    parar de navegar, a sessao se apaga sozinha.
+# ----------------------------------------------------------------------------
+HSET sessao:usr:4471 usuario_id 4471 nome "Ana Beatriz" email "ana.beatriz@email.com" logado_em "2026-11-24T10:05:00" dispositivo "mobile-android"
+EXPIRE sessao:usr:4471 1800
+
+
+# ----------------------------------------------------------------------------
+# 2) CARRINHO DE COMPRAS
+#    Hash campo->valor: o campo e o SKU, o valor e a quantidade.
+#    Estrutura escolhida porque permite alterar UM item sem reescrever o
+#    carrinho inteiro (HINCRBY), que e a operacao mais comum da tela.
+#    TTL de 24 horas: tempo para o cliente voltar e concluir a compra.
+# ----------------------------------------------------------------------------
+HSET carrinho:usr:4471 CEL-SMX-256 1 CAM-BAS-PRT 2 CAB-HDMI-2M 1
+EXPIRE carrinho:usr:4471 86400
+
+# Metadados do carrinho (valores vem do catalogo no MongoDB, cacheados aqui)
+HSET carrinho:meta:usr:4471 valor_total 3729.60 qtd_itens 4 moeda BRL cupom "PRIMEIRACOMPRA10" atualizado_em "2026-11-24T10:26:00"
+EXPIRE carrinho:meta:usr:4471 86400
+
+
+# ----------------------------------------------------------------------------
+# 3) RECUPERACAO DO CARRINHO (o caminho quente da aplicacao)
+# ----------------------------------------------------------------------------
+HGETALL carrinho:usr:4471
+# -> CEL-SMX-256: 1 | CAM-BAS-PRT: 2 | CAB-HDMI-2M: 1
+
+HGET carrinho:usr:4471 CAM-BAS-PRT
+# -> "2"   (le um item especifico, sem trazer o carrinho todo)
+
+HLEN carrinho:usr:4471
+# -> 3     (quantidade de SKUs distintos)
+
+HGETALL carrinho:meta:usr:4471
+
+
+# ----------------------------------------------------------------------------
+# 4) OPERACOES DO USUARIO NA TELA
+# ----------------------------------------------------------------------------
+
+# Aumentar a quantidade de um item (+1 camiseta) - operacao atomica
+HINCRBY carrinho:usr:4471 CAM-BAS-PRT 1
+# -> 3
+
+# Diminuir a quantidade (-1 camiseta)
+HINCRBY carrinho:usr:4471 CAM-BAS-PRT -1
+# -> 2
+
+# Adicionar um novo produto ao carrinho
+HSET carrinho:usr:4471 FON-BT-PRO 1
+
+# Remover um item do carrinho
+HDEL carrinho:usr:4471 CAB-HDMI-2M
+
+# Verificar se um produto ja esta no carrinho (usado pelo botao "adicionar")
+HEXISTS carrinho:usr:4471 CEL-SMX-256
+# -> 1
+
+
+# ----------------------------------------------------------------------------
+# 5) GESTAO DO TTL
+#    Cada interacao do usuario renova a validade do carrinho.
+# ----------------------------------------------------------------------------
+TTL carrinho:usr:4471
+# -> segundos restantes (ex: 86391)
+
+# Renova as 24h a cada interacao do usuario
+EXPIRE carrinho:usr:4471 86400
+EXPIRE carrinho:meta:usr:4471 86400
+
+# Remove o TTL (ex: carrinho convertido em lista de desejos)
+PERSIST carrinho:usr:4471
+
+# Devolve o TTL
+EXPIRE carrinho:usr:4471 86400
+
+
+# ----------------------------------------------------------------------------
+# 6) RESERVA TEMPORARIA DE ESTOQUE (anti-oversell no checkout)
+#    Chave simples com TTL curto: o cliente tem 10 minutos para pagar antes
+#    que a unidade volte a ficar disponivel para outras pessoas.
+# ----------------------------------------------------------------------------
+SET reserva:CEL-SMX-256:usr:4471 1 EX 600 NX
+# NX = so cria se nao existir. Garante que dois usuarios nao reservem o mesmo item.
+
+TTL reserva:CEL-SMX-256:usr:4471
+# -> 600
+
+# Contador de unidades reservadas do SKU (consultado antes de exibir "disponivel")
+INCR estoque:reservado:CEL-SMX-256
+EXPIRE estoque:reservado:CEL-SMX-256 600
+
+
+# ----------------------------------------------------------------------------
+# 7) CONTADORES E RANKING EM TEMPO REAL
+#    Redis resolve em O(log n) o que no relacional seria GROUP BY + ORDER BY
+#    varrendo a tabela de itens de pedido.
+# ----------------------------------------------------------------------------
+ZINCRBY ranking:mais_vendidos 1 CEL-SMX-256
+ZINCRBY ranking:mais_vendidos 2 CAM-BAS-PRT
+ZINCRBY ranking:mais_vendidos 1 FON-BT-PRO
+
+ZREVRANGE ranking:mais_vendidos 0 4 WITHSCORES
+# -> top 5 produtos mais vendidos, pronto para a vitrine da home
+
+INCR metricas:carrinhos_criados:2026-11-24
+INCR metricas:checkouts_iniciados:2026-11-24
+
+
+# ----------------------------------------------------------------------------
+# 8) FINALIZACAO DA VENDA
+#    Momento em que o contexto de Vendas publica o evento consumido pelo
+#    Estoque (MongoDB) e pelo Financeiro (PostgreSQL). Ver a secao de
+#    Integracao Assincrona no README.
+# ----------------------------------------------------------------------------
+
+# Publica o evento no stream de dominio (fonte da verdade para os consumidores)
+XADD eventos:vendas * tipo venda.finalizada pedido PED-2026-0005 usuario_id 4471 valor_total 3729.60 itens "CEL-SMX-256:1,CAM-BAS-PRT:2,FON-BT-PRO:1" ocorrido_em "2026-11-24T10:31:00"
+
+# Notifica os assinantes em tempo real (dashboards, painel do operador)
+PUBLISH canal:vendas "venda.finalizada:PED-2026-0005"
+
+# Limpa o estado efemero: o carrinho cumpriu sua funcao e virou pedido
+DEL carrinho:usr:4471 carrinho:meta:usr:4471 reserva:CEL-SMX-256:usr:4471
+
+EXISTS carrinho:usr:4471
+# -> 0
+
+
+# ----------------------------------------------------------------------------
+# 9) CARRINHO ABANDONADO
+#    Nao precisa de rotina de limpeza: o TTL expira a chave automaticamente.
+#    Um listener de keyspace notification pode disparar o e-mail de retomada.
+# ----------------------------------------------------------------------------
+HSET carrinho:usr:9002 CAM-BAS-PRT 1
+EXPIRE carrinho:usr:9002 5
+TTL carrinho:usr:9002
+# Apos 5 segundos: EXISTS carrinho:usr:9002 -> 0 (sem DELETE manual, sem cron)
+
+# Habilita o aviso de expiracao (consumido pelo servico de e-mail marketing)
+CONFIG SET notify-keyspace-events Ex
+# SUBSCRIBE __keyevent@0__:expired
